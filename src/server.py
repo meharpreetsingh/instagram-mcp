@@ -1,8 +1,10 @@
+import asyncio
 import json
 import logging
 import os
 import sys
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, Any
 from urllib.parse import unquote
@@ -43,8 +45,44 @@ logging.basicConfig(
 
 VERSION = "1.4.0"
 startup_time = time.time()
+POLL_INTERVAL = int(os.environ.get("INSTAGRAM_POLL_INTERVAL", "300"))  # seconds; 0 = disabled
 
-mcp = FastMCP("InstagramDM", version=VERSION)
+
+async def _auto_sync_loop():
+    if POLL_INTERVAL <= 0:
+        return
+    logging.info("Auto-sync started (interval: %ds)", POLL_INTERVAL)
+    while True:
+        await asyncio.sleep(POLL_INTERVAL)
+        if not client or not getattr(client, "user_id", None):
+            continue
+        try:
+            threads = ig.fetch_inbox(client, limit=20)
+            total_new = 0
+            for t in threads:
+                db_mod.upsert_thread(conn, t)
+                total_new += db_mod.upsert_messages(conn, t["thread_id"], t["messages"])
+            logging.info("Auto-sync: %d threads checked, %d new messages", len(threads), total_new)
+        except _SESSION_EXPIRED_EXCEPTIONS:
+            logging.warning("Auto-sync: session expired, skipping cycle")
+        except Exception as e:
+            logging.error("Auto-sync error: %s", e)
+
+
+@asynccontextmanager
+async def _lifespan(server):
+    task = asyncio.create_task(_auto_sync_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+mcp = FastMCP("InstagramDM", version=VERSION, lifespan=_lifespan)
 
 # --- Auth ---
 def _decode(creds: Credentials) -> Credentials:
@@ -209,6 +247,7 @@ def health_check() -> Dict[str, Any]:
         "version": VERSION,
         "logged_in": str(is_logged_in),
         "db_path": str(_db_path),
+        "poll_interval_seconds": POLL_INTERVAL,
     }
     if not is_logged_in and _client_init_error:
         result["login_error"] = _client_init_error
