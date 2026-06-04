@@ -54,7 +54,12 @@ def fetch_thread(client: instagrapi.Client, thread_id: str, limit: int = 50) -> 
 
 def fetch_thread_by_username(client: instagrapi.Client, username: str) -> Thread:
     user_id = client.user_id_from_username(username)
-    thread = client.direct_thread_by_participants([user_id])
+    info = client.direct_thread_by_participants([user_id])
+    thread_data = info.get("thread") or info
+    thread_id = thread_data.get("thread_id") or thread_data.get("id")
+    if not thread_id:
+        raise ValueError(f"No direct thread found with user '{username}'")
+    thread = client.direct_thread(thread_id, amount=50)
     result = _thread_to_dict(thread)
     result["messages"] = list(reversed(result["messages"]))
     return result
