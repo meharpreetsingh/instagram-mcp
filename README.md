@@ -42,6 +42,18 @@ Credentials can also be passed as CLI flags (`--session-id`, `--csrf-token`, `--
 
 ---
 
+## Global install
+
+Run once from the project root to make `ig-dm-mcp` available in any terminal:
+
+```bash
+npm link
+```
+
+To unlink: `npm unlink -g claude-instagram-mcp`
+
+---
+
 ## Running
 
 ```bash
