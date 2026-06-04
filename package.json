@@ -1,0 +1,24 @@
+{
+  "name": "claude-instagram-mcp",
+  "version": "1.4.0",
+  "description": "Instagram DM MCP server for Claude Desktop — local repo with SQLite cache",
+  "main": "launcher/index.js",
+  "bin": {
+    "ig-dm-mcp": "./launcher/cli.js"
+  },
+  "scripts": {
+    "start": "node ./launcher/cli.js start"
+  },
+  "keywords": ["instagram", "dm", "mcp", "claude", "anthropic"],
+  "license": "MIT",
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "commander": "^11.0.0",
+    "cross-spawn": "^7.0.3",
+    "dotenv": "^16.0.0",
+    "inquirer": "^8.2.5"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
