@@ -2,7 +2,7 @@
 'use strict';
 
 // Auto-load .env from project root before anything else reads process.env
-require('dotenv').config({ path: require('path').join(__dirname, '../.env') });
+require('dotenv').config({ path: require('path').join(__dirname, '../.env'), override: true });
 
 const { program } = require('commander');
 const inquirer = require('inquirer');

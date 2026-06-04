@@ -5,13 +5,34 @@ import sys
 import time
 from pathlib import Path
 from typing import Dict, Any
+from urllib.parse import unquote
 
 from fastmcp import FastMCP
+from instagrapi.exceptions import (
+    LoginRequired,
+    ClientLoginRequired,
+    ClientUnauthorizedError,
+    ClientForbiddenError,
+    ReloginAttemptExceeded,
+)
 
 sys.path.insert(0, str(Path(__file__).parent))
 import instagram as ig
 import db as db_mod
 from models import Credentials
+
+_SESSION_EXPIRED_EXCEPTIONS = (
+    LoginRequired,
+    ClientLoginRequired,
+    ClientUnauthorizedError,
+    ClientForbiddenError,
+    ReloginAttemptExceeded,
+)
+
+_SESSION_EXPIRED_MSG = (
+    "Instagram session has expired. "
+    "Update INSTAGRAM_SESSION_ID in .env with a fresh session ID and restart the server."
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,6 +47,10 @@ startup_time = time.time()
 mcp = FastMCP("InstagramDM", version=VERSION)
 
 # --- Auth ---
+def _decode(creds: Credentials) -> Credentials:
+    return {k: unquote(v) if isinstance(v, str) else v for k, v in creds.items()}
+
+
 def _load_credentials() -> Credentials:
     sessionid = os.environ.get("INSTAGRAM_SESSION_ID")
     csrftoken = os.environ.get("INSTAGRAM_CSRF_TOKEN")
@@ -33,14 +58,14 @@ def _load_credentials() -> Credentials:
 
     if sessionid and csrftoken and ds_user_id:
         logging.info("Credentials loaded from environment variables")
-        return {"sessionid": sessionid, "csrftoken": csrftoken, "ds_user_id": ds_user_id}
+        return _decode({"sessionid": sessionid, "csrftoken": csrftoken, "ds_user_id": ds_user_id})
 
     combined = os.environ.get("INSTAGRAM_COOKIES")
     if combined:
         try:
             data = json.loads(combined)
             logging.info("Credentials loaded from INSTAGRAM_COOKIES env var")
-            return data
+            return _decode(data)
         except json.JSONDecodeError:
             logging.error("INSTAGRAM_COOKIES is not valid JSON")
 
@@ -49,7 +74,7 @@ def _load_credentials() -> Credentials:
         try:
             data = json.loads(cookie_file.read_text())
             logging.info("Credentials loaded from instagram_cookies.json")
-            return data
+            return _decode(data)
         except json.JSONDecodeError:
             logging.error("instagram_cookies.json is not valid JSON")
 
@@ -59,11 +84,22 @@ def _load_credentials() -> Credentials:
 
 credentials = _load_credentials()
 client = None
-try:
-    if credentials.get("sessionid"):
+_client_init_error: str | None = None
+_client_init_error_detail: str | None = None
+
+if not credentials.get("sessionid"):
+    _client_init_error = "no_credentials"
+else:
+    try:
         client = ig.init_client(credentials)
-except Exception as e:
-    logging.error("Failed to initialise Instagram client: %s", e)
+    except _SESSION_EXPIRED_EXCEPTIONS as e:
+        logging.error("Instagram session is expired or invalid: %s", e)
+        _client_init_error = "session_expired"
+        _client_init_error_detail = str(e)
+    except Exception as e:
+        logging.error("Failed to initialise Instagram client: %s", e)
+        _client_init_error = "init_failed"
+        _client_init_error_detail = str(e)
 
 # --- DB ---
 _db_path = Path(__file__).parent.parent / "data" / "instagram.db"
@@ -80,7 +116,7 @@ def read_dms(limit: int = 10) -> Dict[str, Any]:
     Args:
         limit: Number of threads to fetch (default 10).
     """
-    if not client:
+    if not client or not getattr(client, "user_id", None):
         return {"status": "error", "message": "Instagram client not initialised — check credentials"}
     try:
         threads = ig.fetch_inbox(client, limit)
@@ -94,6 +130,9 @@ def read_dms(limit: int = 10) -> Dict[str, Any]:
             for msg in thread["messages"]:
                 messages.append({**msg, "thread": thread_info})
         return {"status": "success", "messages": messages}
+    except _SESSION_EXPIRED_EXCEPTIONS as e:
+        logging.warning("read_dms: session expired (%s)", e)
+        return {"status": "error", "error_code": "session_expired", "message": _SESSION_EXPIRED_MSG}
     except Exception as e:
         logging.error("read_dms error: %s", e)
         return {"status": "error", "message": str(e)}
@@ -107,12 +146,15 @@ def send_dm(username: str, message: str) -> Dict[str, Any]:
         username: Instagram username of the recipient.
         message: Message text to send.
     """
-    if not client:
+    if not client or not getattr(client, "user_id", None):
         return {"status": "error", "message": "Instagram client not initialised — check credentials"}
     if not username or not message:
         return {"status": "error", "message": "username and message are required"}
     try:
         return ig.send_message(client, username, message)
+    except _SESSION_EXPIRED_EXCEPTIONS as e:
+        logging.warning("send_dm: session expired (%s)", e)
+        return {"status": "error", "error_code": "session_expired", "message": _SESSION_EXPIRED_MSG}
     except Exception as e:
         logging.error("send_dm error: %s", e)
         return {"status": "error", "message": str(e)}
@@ -127,7 +169,7 @@ def read_chat(thread_id: str = "", username: str = "", limit: int = 50) -> Dict[
         username: Instagram username for 1-to-1 chats.
         limit: Max messages to retrieve (default 50).
     """
-    if not client:
+    if not client or not getattr(client, "user_id", None):
         return {"status": "error", "message": "Instagram client not initialised — check credentials"}
     if not thread_id and not username:
         return {"status": "error", "message": "Provide either thread_id or username"}
@@ -145,22 +187,44 @@ def read_chat(thread_id: str = "", username: str = "", limit: int = 50) -> Dict[
             "message_count": len(thread["messages"]),
             "messages": thread["messages"],
         }
+    except _SESSION_EXPIRED_EXCEPTIONS as e:
+        logging.warning("read_chat: session expired (%s)", e)
+        return {"status": "error", "error_code": "session_expired", "message": _SESSION_EXPIRED_MSG}
     except Exception as e:
         logging.error("read_chat error: %s", e)
         return {"status": "error", "message": str(e)}
 
 
 @mcp.tool()
-def health_check() -> Dict[str, str]:
+def health_check() -> Dict[str, Any]:
     """Check server health and Instagram login status."""
-    is_logged_in = client is not None and hasattr(client, "user_id") and client.user_id is not None
-    return {
+    is_logged_in = (
+        client is not None
+        and hasattr(client, "user_id")
+        and client.user_id is not None
+    )
+    result: Dict[str, Any] = {
         "status": "healthy",
         "service": "InstagramDM MCP Server",
         "version": VERSION,
         "logged_in": str(is_logged_in),
         "db_path": str(_db_path),
     }
+    if not is_logged_in and _client_init_error:
+        result["login_error"] = _client_init_error
+        if _client_init_error == "session_expired":
+            result["login_hint"] = (
+                "Your Instagram session has expired. "
+                "Generate a new session ID and update INSTAGRAM_SESSION_ID in .env, then restart."
+            )
+        elif _client_init_error == "no_credentials":
+            result["login_hint"] = (
+                "No Instagram credentials found. "
+                "Set INSTAGRAM_SESSION_ID in .env and restart."
+            )
+        else:
+            result["login_hint"] = "Instagram client failed to initialise. Check server logs for details."
+    return result
 
 
 # ── New DB-backed tools ─────────────────────────────────────────────────────────
@@ -174,7 +238,7 @@ def sync_thread(thread_id: str = "", username: str = "", limit: int = 100) -> Di
         username: Instagram username for 1-to-1 chats.
         limit: Max messages to fetch and store (default 100).
     """
-    if not client:
+    if not client or not getattr(client, "user_id", None):
         return {"status": "error", "message": "Instagram client not initialised — check credentials"}
     if not thread_id and not username:
         return {"status": "error", "message": "Provide either thread_id or username"}
@@ -195,6 +259,9 @@ def sync_thread(thread_id: str = "", username: str = "", limit: int = 100) -> Di
             "fetched": len(thread["messages"]),
             "new_messages_stored": inserted,
         }
+    except _SESSION_EXPIRED_EXCEPTIONS as e:
+        logging.warning("sync_thread: session expired (%s)", e)
+        return {"status": "error", "error_code": "session_expired", "message": _SESSION_EXPIRED_MSG}
     except Exception as e:
         logging.error("sync_thread error: %s", e)
         return {"status": "error", "message": str(e)}
